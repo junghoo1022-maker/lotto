@@ -2,11 +2,9 @@ name: Lottery Data Auto Ingestion Pipeline
 
 on:
   schedule:
-    # UTC 기준 설정 (한국 시간 = UTC + 9시간)
-    # 1. 목요일 밤 22:00 KST -> 목요일 13:00 UTC (연금복권 업데이트용)
-    # 2. 토요일 밤 22:00 KST -> 토요일 13:00 UTC (로또 업데이트용)
+    # 한국 시간(KST) 매주 목요일/토요일 밤 22:00 자동 실행 (UTC 13:00)
     - cron: '0 13 * * 4,6'
-  workflow_dispatch: # 언제든 수동으로 번호를 뽑아볼 수 있는 버튼 활성화
+  workflow_dispatch: # 수동 가동 버튼 활성화
 
 jobs:
   build_and_run:
@@ -27,6 +25,11 @@ jobs:
         pip install requests
 
     - name: ETL 및 분석 엔진 실행
+      # [핵심 보완] 파이썬 코드가 깃허브 금고(Secrets)에 있는 암호들을 안전하게 읽어갈 수 있도록 환경변수로 바인딩합니다.
+      env:
+        SENDER_EMAIL: ${{ secrets.junghoo1022@gmail.com }}
+        SENDER_PASSWORD: ${{ secrets.amrn aixz lqqh tqfy }}
+        RECEIVER_EMAIL: ${{ secrets.junghoo10@naver.com }}
       run: |
         python updater.py
 
@@ -35,5 +38,4 @@ jobs:
         git config --global user.name "IDS-Bot"
         git config --global user.email "ids-bot@github.com"
         git add lottery.db README.md
-        # 변경 사항이 있을 때만 커밋 수행 (에러 방지용 가드)
         git diff --staged --quiet || (git commit -m "🤖 [자동 배치] 로터리 DB 데이터 적재 및 차기 분석 번호 최신화" && git push)
