@@ -27,9 +27,9 @@ jobs:
     - name: ETL 및 분석 엔진 실행
       # [핵심 보완] 파이썬 코드가 깃허브 금고(Secrets)에 있는 암호들을 안전하게 읽어갈 수 있도록 환경변수로 바인딩합니다.
       env:
-        SENDER_EMAIL: ${{ secrets.junghoo1022@gmail.com }}
-        SENDER_PASSWORD: ${{ secrets.amrn aixz lqqh tqfy }}
-        RECEIVER_EMAIL: ${{ secrets.junghoo10@naver.com }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
       run: |
         python updater.py
 
