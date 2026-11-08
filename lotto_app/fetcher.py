@@ -11,6 +11,9 @@ import requests
 
 from . import db, paths, rounds
 
+# 2025~2026 사이트 개편 이후 주소 (공개 라이브러리 seongilp/dhlottery-api 에서 사용 중인 것을 참고)
+LOTTO_NEW_URL = "https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do"
+# 개편 전 주소 (예비)
 LOTTO_URL = "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo={rnd}"
 PENSION_URL = "https://www.dhlottery.co.kr/gameResult.do?method=win720&Round={rnd}"
 TIMEOUT = 8
@@ -38,8 +41,66 @@ def is_online() -> bool:
 
 def _session():
     s = requests.Session()
-    s.headers.update({"Accept": "application/json, text/html;q=0.9"})
+    s.headers.update({
+        "User-Agent": "LottoAnalyzer/1.1 (personal use)",
+        "Accept-Language": "ko-KR,ko;q=0.9",
+    })
+    try:  # 첫 방문 쿠키 받기
+        s.get("https://www.dhlottery.co.kr/", timeout=TIMEOUT)
+    except requests.RequestException:
+        pass
     return s
+
+
+def _snippet(res):
+    return f"HTTP {res.status_code}, {res.headers.get('Content-Type', '')}, 앞부분: {res.text[:200]!r}"
+
+
+def fetch_lotto_new(session, rnd: int):
+    """새 주소. 응답 목록에 여러 회차가 올 수 있어 {round: (nums, bonus, date)} 로 반환."""
+    try:
+        res = session.get(LOTTO_NEW_URL, params={"srchLtEpsd": rnd}, timeout=TIMEOUT, allow_redirects=False,
+                          headers={"Accept": "application/json, text/javascript, */*; q=0.01",
+                                   "X-Requested-With": "XMLHttpRequest",
+                                   "Referer": "https://www.dhlottery.co.kr/"})
+    except requests.RequestException as e:
+        raise FetchError(f"로또 {rnd}회(새 주소): 네트워크 오류 ({e.__class__.__name__})")
+    if res.status_code != 200:
+        raise FetchError(f"로또 {rnd}회(새 주소): {_snippet(res)}")
+    try:
+        items = (res.json().get("data") or {}).get("list") or []
+    except ValueError:
+        raise FetchError(f"로또 {rnd}회(새 주소): JSON 아님 · {_snippet(res)}")
+    out = {}
+    if not items:
+        return out  # 정상 응답인데 목록이 비어 있음 = 아직 추첨 전
+    for it in items:
+        try:
+            r = int(it["ltEpsd"])
+            nums = [int(it[f"tm{n}WnNo"]) for n in range(1, 7)]
+            bonus = int(it["bnsWnNo"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out[r] = (nums, bonus, None)
+    if not out:
+        fetcher_keys = list(items[0].keys())[:15] if items else []
+        raise FetchError(f"로또 {rnd}회(새 주소): 번호 항목을 찾지 못함 · 키 {fetcher_keys} · {_snippet(res)}")
+    return out
+
+
+def fetch_lotto_any(session, rnd: int):
+    """새 주소 → 예전 주소 순서로 시도. {round: (nums, bonus, date)} 또는 {} (아직 추첨 전)."""
+    errors = []
+    try:
+        return fetch_lotto_new(session, rnd)  # 해당 회차가 없으면 아직 추첨 전
+    except FetchError as e:
+        errors.append(str(e))
+    try:
+        old = fetch_lotto_round(session, rnd)
+        return {rnd: old} if old else {}
+    except FetchError as e:
+        errors.append(str(e))
+    raise FetchError(" / ".join(errors))
 
 
 def fetch_lotto_round(session, rnd: int):
@@ -110,23 +171,29 @@ def update_all(progress=None, stop_after_errors=3):
     latest = rounds.lotto_latest_drawn()
     missing = [r for r in range(1, latest + 1) if r not in have]
     errors = 0
+    cache = {}
     for i, rnd in enumerate(missing):
         report(f"로또 {rnd}회 수집 중… ({i + 1}/{len(missing)})", (i + 1) / max(len(missing), 1) * 0.6)
-        try:
-            got = fetch_lotto_round(session, rnd)
-        except FetchError as e:
-            summary["errors"].append(str(e)); log(str(e)); errors += 1
-            if errors >= stop_after_errors:
-                summary["errors"].append("로또: 연속 오류로 자동 수집을 중단했습니다.")
-                break
-            continue
-        if got is None:
-            break
-        nums, bonus, d = got
+        if rnd not in cache:
+            try:
+                cache.update(fetch_lotto_any(session, rnd))
+            except FetchError as e:
+                summary["errors"].append(str(e)); log(str(e)); errors += 1
+                if errors >= stop_after_errors:
+                    summary["errors"].append("로또: 연속 오류로 자동 수집을 중단했습니다.")
+                    break
+                continue
+        if rnd not in cache:
+            break  # 아직 추첨 전
+        nums, bonus, d = cache.pop(rnd)
         db.upsert_lotto(rnd, d or str(rounds.lotto_draw_date(rnd)), nums, bonus, source="auto")
         summary["lotto_added"] += 1
         errors = 0
         time.sleep(0.05)
+    for r, (nums, bonus, d) in cache.items():  # 한 번에 같이 받은 다른 회차도 저장
+        if r not in db.lotto_rounds_set():
+            db.upsert_lotto(r, d or str(rounds.lotto_draw_date(r)), nums, bonus, source="auto")
+            summary["lotto_added"] += 1
 
     # 연금
     have = db.pension_rounds_set()
@@ -157,12 +224,18 @@ def diagnose():
     """수집 테스트: 각 1회씩 시도하고 결과를 사람이 읽을 문장으로 반환."""
     s = _session()
     lines = []
+    r = rounds.lotto_latest_drawn()
     try:
-        r = rounds.lotto_latest_drawn()
-        got = fetch_lotto_round(s, r)
-        lines.append(f"✅ 로또 {r}회 수집 성공: {got[0]} + 보너스 {got[1]}" if got else f"⚠️ 로또 {r}회 아직 결과 없음")
+        got = fetch_lotto_new(s, r)
+        lines.append(f"✅ 로또 {r}회 (새 주소) 성공: {got[r][0]} + 보너스 {got[r][1]}" if r in got
+                     else f"⚠️ 로또 새 주소 응답은 왔지만 {r}회가 없음 (받은 회차 {sorted(got)[:5]})")
     except FetchError as e:
         lines.append(f"❌ {e}")
+    try:
+        got = fetch_lotto_round(s, r)
+        lines.append(f"✅ 로또 {r}회 (예전 주소) 성공: {got[0]}" if got else f"⚠️ 로또 {r}회 (예전 주소) 결과 없음")
+    except FetchError as e:
+        lines.append(f"❌ (예전 주소) {e}")
     try:
         r = rounds.pension_latest_drawn()
         grp, num, bonus = fetch_pension_round(s, r)
