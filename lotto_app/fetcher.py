@@ -145,16 +145,157 @@ def _parse_pension_html(html: str, rnd: int):
 
 
 def fetch_pension_round(session, rnd: int):
+    """예전 주소 (개편 후 메인으로 넘어감)."""
     try:
         res = session.get(PENSION_URL.format(rnd=rnd), timeout=TIMEOUT, allow_redirects=False)
     except requests.RequestException as e:
         raise FetchError(f"연금 {rnd}회: 네트워크 오류 ({e.__class__.__name__})")
     if res.status_code in (301, 302, 303, 307, 308):
-        raise FetchError(f"연금 {rnd}회: 다른 페이지로 넘김(HTTP {res.status_code}). 차단 또는 주소 변경 가능")
+        raise FetchError(f"연금 {rnd}회(예전 주소): 다른 페이지로 넘김(HTTP {res.status_code})")
     if res.status_code != 200:
-        raise FetchError(f"연금 {rnd}회: HTTP {res.status_code}")
+        raise FetchError(f"연금 {rnd}회(예전 주소): HTTP {res.status_code}")
     res.encoding = res.apparent_encoding or "utf-8"
     return _parse_pension_html(res.text, rnd)
+
+
+# ---------- 연금복권: 개편된 사이트 ----------
+# 개편 후 결과 페이지는 /pt720/result. 이 페이지가 내부에서 부르는 데이터 주소는 아직 확인되지 않아,
+# 로또 주소(/lt645/selectPstLt645Info.do, srchLtEpsd) 규칙을 본뜬 후보 + 페이지에서 찾아낸 주소를 차례로 시도합니다.
+PENSION_PAGES = ["https://www.dhlottery.co.kr/pt720/result", "https://m.dhlottery.co.kr/pt720/result"]
+PENSION_GUESS_URLS = ["https://www.dhlottery.co.kr/pt720/selectPstPt720Info.do"]
+PENSION_GUESS_PARAMS = ["srchPsltEpsd", "srchLtEpsd", "srchEpsd", "psltEpsd", "ltEpsd"]
+_XHR = {"Accept": "application/json, text/javascript, */*; q=0.01", "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.dhlottery.co.kr/pt720/result"}
+
+
+def discover_pension(session):
+    """결과 페이지와 그 스크립트에서 /pt720/...do 주소와 회차 파라미터 이름을 찾아낸다."""
+    urls, params, notes = [], [], []
+    for page in PENSION_PAGES:
+        try:
+            res = session.get(page, timeout=TIMEOUT)
+        except requests.RequestException as e:
+            notes.append(f"{page}: {e.__class__.__name__}")
+            continue
+        notes.append(f"{page}: HTTP {res.status_code}, 길이 {len(res.text)}")
+        texts = [res.text]
+        base = page.split("/pt720")[0]
+        for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', res.text)[:15]:
+            if src.startswith("//") or ("http" in src and "dhlottery" not in src):
+                continue
+            full = src if src.startswith("http") else base + ("" if src.startswith("/") else "/") + src
+            if "pt720" in full or "result" in full or "common" in full or "app" in full:
+                try:
+                    texts.append(session.get(full, timeout=TIMEOUT).text)
+                except requests.RequestException:
+                    pass
+        for t in texts:
+            for u in re.findall(r'["\'](/pt720/[A-Za-z0-9_/]+\.do)', t):
+                full = base + u
+                if full not in urls:
+                    urls.append(full)
+            for prm in re.findall(r'\b(srch\w*Epsd\w*|\w*[Ee]psd)\b', t):
+                if prm not in params and len(prm) < 30:
+                    params.append(prm)
+        # 결과 페이지가 번호를 HTML에 직접 넣어 주는 경우를 대비해 원문도 보관
+        session._pension_page_html = getattr(session, "_pension_page_html", "") or res.text
+    return urls, params, notes
+
+
+def _find_pension_items(obj):
+    """JSON 어디에 있든 '회차'처럼 보이는 키를 가진 dict 들을 찾는다."""
+    found = []
+    if isinstance(obj, dict):
+        if any(re.search(r"epsd|round|drw", k, re.I) for k in obj):
+            found.append(obj)
+        for v in obj.values():
+            found += _find_pension_items(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            found += _find_pension_items(v)
+    return found
+
+
+def _item_to_pension(it):
+    """dict 하나 → (round, grp, num, bonus) 추정. 실패 시 None."""
+    rnd = grp = num = bonus = None
+    digits = {}
+    for k, v in it.items():
+        kl = k.lower()
+        sv = str(v).strip() if v is not None else ""
+        if rnd is None and re.search(r"epsd|round|drwno", kl) and sv.isdigit() and "view" not in kl:
+            rnd = int(sv)
+        elif grp is None and re.search(r"jo|grp|group|bnd|cls", kl) and sv.isdigit() and 1 <= int(sv) <= 5 and "bns" not in kl:
+            grp = int(sv)
+        elif re.search(r"bns|bonus", kl) and len(sv) == 6 and sv.isdigit():
+            bonus = sv
+        elif len(sv) == 6 and sv.isdigit() and num is None and "ymd" not in kl and "dt" not in kl:
+            num = sv
+        m = re.search(r"(\d)$", k)
+        if m and sv.isdigit() and len(sv) == 1 and not re.search(r"bns|bonus", kl):
+            digits[int(m.group(1))] = sv
+    if num is None and all(i in digits for i in range(1, 7)):
+        num = "".join(digits[i] for i in range(1, 7))
+    if rnd and grp and num:
+        return rnd, grp, num, bonus
+    return None
+
+
+def _try_pension_endpoint(session, url, param, rnd):
+    res = session.get(url, params={param: rnd}, timeout=TIMEOUT, allow_redirects=False, headers=_XHR)
+    if res.status_code != 200:
+        raise FetchError(f"{url}?{param}=: {_snippet(res)}")
+    try:
+        data = res.json()
+    except ValueError:
+        raise FetchError(f"{url}?{param}=: JSON 아님 · {_snippet(res)}")
+    out = {}
+    for it in _find_pension_items(data):
+        got = _item_to_pension(it)
+        if got:
+            out[got[0]] = got[1:]
+    if not out:
+        raise FetchError(f"{url}?{param}=: 번호를 해석하지 못함 · 응답 {str(data)[:400]}")
+    return out
+
+
+def fetch_pension_any(session, rnd: int):
+    """{round: (grp, num, bonus)} 반환. 성공한 주소는 기억해 두고 다음부터 먼저 사용."""
+    saved = db.get_setting("pension_endpoint")
+    tries = []
+    if saved and "|" in saved:
+        tries.append(tuple(saved.split("|", 1)))
+    if not getattr(session, "_pension_discovered", False):
+        urls, params, notes = discover_pension(session)
+        session._pension_discovered = True
+        session._pension_tries = [(u, p) for u in urls + PENSION_GUESS_URLS for p in params + PENSION_GUESS_PARAMS]
+        log("[연금 주소 탐색] " + " / ".join(notes) + f" · 찾은 주소 {urls} · 파라미터 후보 {params}")
+    for t in getattr(session, "_pension_tries", []):
+        if t not in tries:
+            tries.append(t)
+    errors = []
+    for url, param in tries[:40]:
+        try:
+            out = _try_pension_endpoint(session, url, param, rnd)
+            db.set_setting("pension_endpoint", f"{url}|{param}")
+            return out
+        except (FetchError, requests.RequestException) as e:
+            errors.append(str(e)[:300])
+    # 최신 회차라면 결과 페이지 HTML에서 직접 읽기
+    html = getattr(session, "_pension_page_html", "")
+    if html:
+        try:
+            grp, num, bonus = _parse_pension_html(html, rnd)
+            return {rnd: (grp, num, bonus)}
+        except FetchError as e:
+            errors.append(f"결과 페이지 직접 읽기: {e}")
+    try:
+        return {rnd: fetch_pension_round(session, rnd)}
+    except FetchError as e:
+        errors.append(str(e))
+    for e in errors:
+        log(f"[연금 {rnd}회 시도 실패] {e}")
+    raise FetchError(f"연금 {rnd}회: 자동 수집 실패 (시도 {len(errors)}가지, 자세한 내용은 기록 파일)")
 
 
 def update_all(progress=None, stop_after_errors=3):
@@ -198,22 +339,34 @@ def update_all(progress=None, stop_after_errors=3):
     # 연금
     have = db.pension_rounds_set()
     latest = rounds.pension_latest_drawn()
-    missing = [r for r in range(1, latest + 1) if r not in have]
+    # 최신 회차부터 (공식 사이트는 최근 약 1년치만 조회된다는 안내가 있음)
+    missing = [r for r in range(latest, 0, -1) if r not in have]
     errors = 0
+    cache = {}
     for i, rnd in enumerate(missing):
         report(f"연금복권 {rnd}회 수집 중… ({i + 1}/{len(missing)})", 0.6 + (i + 1) / max(len(missing), 1) * 0.4)
-        try:
-            grp, num, bonus = fetch_pension_round(session, rnd)
-        except FetchError as e:
-            summary["errors"].append(str(e)); log(str(e)); errors += 1
-            if errors >= stop_after_errors:
-                summary["errors"].append("연금복권: 연속 오류로 자동 수집을 중단했습니다.")
-                break
+        if rnd not in cache:
+            try:
+                cache.update(fetch_pension_any(session, rnd))
+            except FetchError as e:
+                summary["errors"].append(str(e)); log(str(e)); errors += 1
+                if errors >= stop_after_errors:
+                    summary["errors"].append("연금복권: 연속 오류로 자동 수집을 중단했습니다.")
+                    break
+                continue
+        if rnd not in cache:
+            errors += 1
             continue
+        grp, num, bonus = cache.pop(rnd)
         db.upsert_pension(rnd, str(rounds.pension_draw_date(rnd)), grp, num, bonus, source="auto")
         summary["pension_added"] += 1
         errors = 0
         time.sleep(0.05)
+    have = db.pension_rounds_set()
+    for r, (grp, num, bonus) in cache.items():
+        if r not in have and 1 <= r <= latest:
+            db.upsert_pension(r, str(rounds.pension_draw_date(r)), grp, num, bonus, source="auto")
+            summary["pension_added"] += 1
 
     log(f"수집 완료: 로또 +{summary['lotto_added']}, 연금 +{summary['pension_added']}, 오류 {len(summary['errors'])}건")
     report("수집 완료", 1.0)
@@ -236,10 +389,14 @@ def diagnose():
         lines.append(f"✅ 로또 {r}회 (예전 주소) 성공: {got[0]}" if got else f"⚠️ 로또 {r}회 (예전 주소) 결과 없음")
     except FetchError as e:
         lines.append(f"❌ (예전 주소) {e}")
+    r = rounds.pension_latest_drawn()
     try:
-        r = rounds.pension_latest_drawn()
-        grp, num, bonus = fetch_pension_round(s, r)
-        lines.append(f"✅ 연금 {r}회 수집 성공: {grp}조 {num} (보너스 {bonus or '미확인'})")
+        got = fetch_pension_any(s, r)
+        if r in got:
+            g, num, bonus = got[r]
+            lines.append(f"✅ 연금 {r}회 성공: {g}조 {num} (보너스 {bonus or '미확인'}) · 사용 주소 {db.get_setting('pension_endpoint') or '결과 페이지'}")
+        else:
+            lines.append(f"⚠️ 연금 응답은 왔지만 {r}회가 없음 (받은 회차 {sorted(got)[:5]})")
     except FetchError as e:
         lines.append(f"❌ {e}")
     for ln in lines:
